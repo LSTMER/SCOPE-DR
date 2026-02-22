@@ -37,7 +37,16 @@ def denormalize(tensor):
 # ==========================================
 # 3. 评估核心逻辑
 # ==========================================
-def evaluate_metrics(model, val_loader, device):
+def evaluate_metrics(model, val_loader, device, concept_columns=None):
+    """
+    完整评估函数 - 包含 Precision, Recall, F1 指标
+
+    Args:
+        model: 待评估模型
+        val_loader: 验证集 DataLoader
+        device: 计算设备
+        concept_columns: 病灶类型名称列表
+    """
     print("\n" + "="*50)
     print("📊 Starting Full Evaluation...")
     print("="*50)
@@ -65,32 +74,131 @@ def evaluate_metrics(model, val_loader, device):
             all_lesion_probs.append(lesion_probs.cpu().numpy())
             all_lesion_labels.append(lesion_labels.cpu().numpy())
 
-    # 1. 计算分级指标 (Stage 2 Task)
+    # ========== 1. 分级任务指标 (多分类) ==========
     acc = accuracy_score(all_grade_labels, all_grade_preds)
     kappa = cohen_kappa_score(all_grade_labels, all_grade_preds, weights='quadratic')
     cm = confusion_matrix(all_grade_labels, all_grade_preds)
 
-    print(f"\n✅ --- Grading Performance ---")
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Kappa:    {kappa:.4f}")
-    print("Confusion Matrix:")
+    # 添加 Precision, Recall, F1 (多分类)
+    precision_macro = precision_score(all_grade_labels, all_grade_preds, average='macro', zero_division=0)
+    recall_macro = recall_score(all_grade_labels, all_grade_preds, average='macro', zero_division=0)
+    f1_macro = f1_score(all_grade_labels, all_grade_preds, average='macro', zero_division=0)
+
+    precision_weighted = precision_score(all_grade_labels, all_grade_preds, average='weighted', zero_division=0)
+    recall_weighted = recall_score(all_grade_labels, all_grade_preds, average='weighted', zero_division=0)
+    f1_weighted = f1_score(all_grade_labels, all_grade_preds, average='weighted', zero_division=0)
+
+    print(f"\n✅ --- Grading Performance (多分类) ---")
+    print(f"Accuracy:         {acc:.4f}")
+    print(f"Kappa:            {kappa:.4f}")
+    print(f"Precision (macro): {precision_macro:.4f}")
+    print(f"Recall (macro):    {recall_macro:.4f}")
+    print(f"F1 Score (macro):  {f1_macro:.4f}")
+    print(f"Precision (weighted): {precision_weighted:.4f}")
+    print(f"Recall (weighted):    {recall_weighted:.4f}")
+    print(f"F1 Score (weighted):  {f1_weighted:.4f}")
+    print("\nConfusion Matrix:")
     print(cm)
 
-    # 2. 计算病灶识别指标 (Stage 1 Task)
+    # 可选：打印每个类别的详细指标
+    print("\nPer-Class Report:")
+    print(classification_report(all_grade_labels, all_grade_preds, zero_division=0))
+
+    # ========== 2. 病灶识别任务指标 (多标签二分类) ==========
     all_lesion_probs = np.concatenate(all_lesion_probs, axis=0)
     all_lesion_labels = np.concatenate(all_lesion_labels, axis=0)
 
-    print(f"\n✅ --- Concept Detection AUC ---")
+    # 将概率转换为预测标签 (阈值=0.5)
+    threshold = 0.5
+    all_lesion_preds = (all_lesion_probs >= threshold).astype(int)
+
+    print(f"\n✅ --- Concept Detection (多标签二分类) ---")
+    print(f"Prediction Threshold: {threshold}")
+
+    # --- AUC 指标 ---
+    print(f"\n--- AUC Scores ---")
     try:
         macro_auc = roc_auc_score(all_lesion_labels, all_lesion_probs, average='macro')
         print(f"Macro Average AUC: {macro_auc:.4f}")
-
-        # 打印每个病灶的独立 AUC
-        for i, concept in enumerate(CONCEPT_COLUMNS):
-            auc_i = roc_auc_score(all_lesion_labels[:, i], all_lesion_probs[:, i])
-            print(f" - {concept}: {auc_i:.4f}")
     except Exception as e:
-        print(f"AUC calculation error (usually due to missing positive labels in a batch): {e}")
+        print(f"AUC calculation error: {e}")
+        macro_auc = None
+
+    # --- Precision, Recall, F1 (每个病灶类型) ---
+    print(f"\n--- Per-Concept Metrics (P/R/F1) ---")
+    concept_columns = concept_columns or [f"Lesion_{i}" for i in range(all_lesion_labels.shape[1])]
+
+    lesion_metrics = {}
+    for i, concept in enumerate(concept_columns):
+        try:
+            p_i = precision_score(all_lesion_labels[:, i], all_lesion_preds[:, i], zero_division=0)
+            r_i = recall_score(all_lesion_labels[:, i], all_lesion_preds[:, i], zero_division=0)
+            f1_i = f1_score(all_lesion_labels[:, i], all_lesion_preds[:, i], zero_division=0)
+
+            # 尝试计算 AUC
+            try:
+                auc_i = roc_auc_score(all_lesion_labels[:, i], all_lesion_probs[:, i])
+            except:
+                auc_i = None
+
+            lesion_metrics[concept] = {
+                'precision': p_i,
+                'recall': r_i,
+                'f1': f1_i,
+                'auc': auc_i,
+                'support': int(all_lesion_labels[:, i].sum())  # 正样本数量
+            }
+
+            print(f" - {concept:20s}: P={p_i:.4f}, R={r_i:.4f}, F1={f1_i:.4f}" +
+                  (f", AUC={auc_i:.4f}" if auc_i else "") +
+                  f", Support={lesion_metrics[concept]['support']}")
+        except Exception as e:
+            print(f" - {concept:20s}: Error - {e}")
+            lesion_metrics[concept] = None
+
+    # --- 整体平均指标 ---
+    print(f"\n--- Overall Average Metrics ---")
+    try:
+        # 样本级平均 (sample-based)
+        precision_samples = precision_score(all_lesion_labels, all_lesion_preds, average='samples', zero_division=0)
+        recall_samples = recall_score(all_lesion_labels, all_lesion_preds, average='samples', zero_division=0)
+        f1_samples = f1_score(all_lesion_labels, all_lesion_preds, average='samples', zero_division=0)
+
+        # 标签级平均 (label-based, macro)
+        precision_macro = precision_score(all_lesion_labels, all_lesion_preds, average='macro', zero_division=0)
+        recall_macro = recall_score(all_lesion_labels, all_lesion_preds, average='macro', zero_division=0)
+        f1_macro = f1_score(all_lesion_labels, all_lesion_preds, average='macro', zero_division=0)
+
+        print(f"Sample-based  - P={precision_samples:.4f}, R={recall_samples:.4f}, F1={f1_samples:.4f}")
+        print(f"Label-based   - P={precision_macro:.4f}, R={recall_macro:.4f}, F1={f1_macro:.4f}")
+    except Exception as e:
+        print(f"Average metrics error: {e}")
+
+    print("\n" + "="*50)
+    print("✅ Evaluation Complete!")
+    print("="*50)
+
+    # ========== 返回所有指标 (便于记录/保存) ==========
+    results = {
+        'grading': {
+            'accuracy': acc,
+            'kappa': kappa,
+            'precision_macro': precision_macro,
+            'recall_macro': recall_macro,
+            'f1_macro': f1_macro,
+            'precision_weighted': precision_weighted,
+            'recall_weighted': recall_weighted,
+            'f1_weighted': f1_weighted,
+            'confusion_matrix': cm
+        },
+        'lesion_detection': {
+            'macro_auc': macro_auc,
+            'per_concept': lesion_metrics,
+            'threshold': threshold
+        }
+    }
+
+    return results
 
 # ==========================================
 # 4. 可视化核心逻辑 (按分级抽样)
