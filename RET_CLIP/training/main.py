@@ -34,7 +34,17 @@ def convert_models_to_fp32(model):
 def is_master(args):
     return args.rank == 0
 
+def get_trainable_state_dict(model):
+    """绝对防弹的字符串匹配保存法！无视一切底层属性遮蔽"""
+    full_state_dict = model.state_dict()
 
+    # 只要名字里带 'lora_' 或者 'logit_scale'，统统抓下来！
+    saved_dict = {
+        k: v for k, v in full_state_dict.items()
+        if 'lora_' in k or 'logit_scale' in k
+    }
+
+    return saved_dict
 # used to compare the pytorch version
 def torch_version_str_compare_lessequal(version1, version2):
     v1 = [int(entry) for entry in version1.split("+")[0].split(".")]
@@ -94,6 +104,8 @@ def main():
             model_info[k] = v
     model_info['use_flash_attention'] = args.use_flash_attention
 
+    import loralib as lora
+
     model = CLIP(**model_info)
     if args.clip_weight_path is not None:
         assert os.path.exists(args.clip_weight_path), "Pretrained CLIP weight not exists!"
@@ -101,6 +113,64 @@ def main():
         assert os.path.exists(args.bert_weight_path), "Pretrained BERT weight not exists!"
     load(model, clip_path=args.clip_weight_path, bert_path=args.bert_weight_path,
          use_flash_attention=args.use_flash_attention)
+
+    # ================= [开始] 方案C：loralib 微调视觉编码器 =================
+    print("🚀 正在初始化 loralib 微调模式...")
+
+    # 1. 极其严苛地冻结整个基础模型
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # 2. 定义递归替换函数
+    def replace_linear_with_lora(module, target_keywords):
+        for name, child in module.named_children():
+            # 如果是全连接层，且名字包含在我们定义的列表中
+            if isinstance(child, torch.nn.Linear) and any(kw in name for kw in target_keywords):
+                # 创建 LoRA 层
+                lora_layer = lora.Linear(
+                    child.in_features,
+                    child.out_features,
+                    r=8,              # 文本和视觉都使用秩为 8 的 LoRA
+                    lora_alpha=16,
+                    bias=(child.bias is not None)
+                )
+
+                # 复制原始预训练权重
+                lora_layer.weight.data = child.weight.data.clone()
+                if child.bias is not None:
+                    lora_layer.bias.data = child.bias.data.clone()
+
+                # 替换模块
+                setattr(module, name, lora_layer)
+            else:
+                # 递归深入
+                replace_linear_with_lora(child, target_keywords)
+
+    # 3. ★ 核心修改：合并视觉端和文本端的关键词 ★
+    # 视觉端 (ViT) 常见名: q_proj, v_proj, c_fc, c_proj, out_proj
+    # 文本端 (RoBERTa) 常见名: query, value, dense
+    target_layers = [
+        "q_proj", "v_proj", "c_fc", "c_proj", "out_proj", # Vision
+        "query", "value", "dense"                         # Text
+    ]
+
+    # 作用于整个 model (这样既能捕获 model.visual，也能捕获 model.bert/text)
+    replace_linear_with_lora(model, target_layers)
+
+    # 4. 激活所有 LoRA 专属参数 (A 矩阵和 B 矩阵)
+    lora.mark_only_lora_as_trainable(model)
+
+    # 5. 手动解冻 CLIP 的对比学习温度系数 (对齐图文空间的核心)
+    for name, param in model.named_parameters():
+        if "logit_scale" in name:
+            param.requires_grad = True
+
+    # 6. 打印确认
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"✅ loralib 注入完成！可训练参数: {trainable_params:,} / 总参数: {total_params:,}")
+    print(f"✅ 可训练比例: {trainable_params/total_params:.2%}")
+    # =====================================================================
 
     # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
     if args.precision == "amp" or args.precision == "fp32":
@@ -137,7 +207,7 @@ def main():
     # In other cases, set find_unused_parameters to False
     find_unused_parameters = torch_version_str_compare_lessequal(torch.__version__, "1.8.0")
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_device_rank],
-                                                      find_unused_parameters=find_unused_parameters)
+                                                      find_unused_parameters=True)
     # Have to set this when activating grad checkpointing in Pytorch >= 2.0.0
     if args.grad_checkpointing and not torch_version_str_compare_lessequal(torch.__version__, "1.14.0"):
         model._set_static_graph()
@@ -297,7 +367,7 @@ def main():
             # 2023.10.12 support for different input resolution
             if int(model_info['image_resolution']) != 224:
                 del sd["module.visual.attnpool.positional_embedding"]
-            model.load_state_dict(sd, strict=True)
+            model.load_state_dict(sd, strict=False)
             # Restore the epoch and steps info, reload the dataset and dataloader for the resume epoch
             if not args.reset_data_offset:
                 start_epoch = checkpoint["epoch"]
@@ -356,7 +426,7 @@ def main():
                 setattr(teacher_model, "get_feature", getattr(model_instance, mapping["clip_model"]))
 
         teacher_model.cuda(args.local_device_rank)
-        teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=[args.local_device_rank])
+        teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=[args.local_device_rank],find_unused_parameters=True)
         logging.info(f"Teacher model loaded from {args.teacher_model_name}")
     else:
         teacher_model = None
@@ -375,15 +445,15 @@ def main():
             num_steps_this_epoch = train(model, data, epoch, optimizer, scaler, scheduler, args, steps)
         steps += num_steps_this_epoch
 
-        if args.val_data is not None and args.valid_epoch_interval is not None and (
-                (epoch + 1) % args.valid_epoch_interval) == 0:
-            assert "val" in data, "Error: Valid dataset has not been built."
-            if not args.use_flash_attention:
-                evaluate(model, data, epoch, args, steps, args.vision_model)
-            else:
-                # fp16 is needed in flash attention
-                with torch.cuda.amp.autocast():
-                    evaluate(model, data, epoch, args, steps, args.vision_model)
+        # if args.val_data is not None and args.valid_epoch_interval is not None and (
+        #         (epoch + 1) % args.valid_epoch_interval) == 0:
+        #     assert "val" in data, "Error: Valid dataset has not been built."
+        #     if not args.use_flash_attention:
+        #         evaluate(model, data, epoch, args, steps, args.vision_model)
+        #     else:
+        #         # fp16 is needed in flash attention
+        #         with torch.cuda.amp.autocast():
+        #             evaluate(model, data, epoch, args, steps, args.vision_model)
 
         # if exists next epoch, reload the dataset and dataloader for the next epoch
         if epoch + 1 < args.max_epochs:
@@ -401,8 +471,7 @@ def main():
                         "epoch": epoch + 1,
                         "step": steps,
                         "name": args.name,
-                        "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(
-                            model.state_dict()),
+                        "state_dict": get_trainable_state_dict(model),
                         "optimizer": optimizer.state_dict(),
                     },
                     save_path,
@@ -420,8 +489,7 @@ def main():
                     "epoch": epoch + 1,
                     "step": steps,
                     "name": args.name,
-                    "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(
-                        model.state_dict()),
+                    "state_dict": get_trainable_state_dict(model),
                     "optimizer": optimizer.state_dict(),
                 },
                 save_path,

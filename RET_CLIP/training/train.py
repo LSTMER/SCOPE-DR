@@ -21,6 +21,17 @@ from eval_RFMiD import eval_multiLabelCls_ViT, eval_multiLabelCls_RN50
 def is_master(args):
     return args.rank == 0
 
+def get_trainable_state_dict(model):
+    """绝对防弹的字符串匹配保存法！无视一切底层属性遮蔽"""
+    full_state_dict = model.state_dict()
+
+    # 只要名字里带 'lora_' 或者 'logit_scale'，统统抓下来！
+    saved_dict = {
+        k: v for k, v in full_state_dict.items()
+        if 'lora_' in k or 'logit_scale' in k
+    }
+
+    return saved_dict
 
 def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     """Returns cosine similarity between x1 and x2, computed along dim."""
@@ -467,8 +478,7 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                     "epoch": epoch + 1,
                     "step": step + 1,
                     "name": args.name,
-                    "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(
-                        model.state_dict()),
+                    "state_dict": get_trainable_state_dict(model),
                     "optimizer": optimizer.state_dict(),
                 },
                 save_path,
@@ -486,8 +496,7 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                     "epoch": epoch + 1,
                     "step": step + 1,
                     "name": args.name,
-                    "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(
-                        model.state_dict()),
+                    "state_dict": get_trainable_state_dict(model),
                     "optimizer": optimizer.state_dict(),
                 },
                 save_path,

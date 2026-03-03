@@ -21,18 +21,20 @@ class DRDataset(Dataset):
         if isinstance(csv_files, str): csv_files = [csv_files]
         if isinstance(img_dirs, str): img_dirs = [img_dirs]
         assert len(csv_files) == len(img_dirs), "CSV 文件数量必须与图片文件夹数量一致！"
+
         df_list = []
         for csv_path, img_path in zip(csv_files, img_dirs):
-            # 注意：确保你的 CSV 里有 ID, RATE, EX... 这些列
             temp_df = pd.read_csv(csv_path, dtype={'ID': str})
             temp_df['img_root'] = img_path
             df_list.append(temp_df)
         self.data = pd.concat(df_list, ignore_index=True)
 
         self.grade_map = {
-            0: "正常的", 1: "轻度非增殖性糖尿病视网膜病变(Mild NPDR)",
+            0: "正常的",
+            1: "轻度非增殖性糖尿病视网膜病变(Mild NPDR)",
             2: "中度非增殖性糖尿病视网膜病变(Moderate NPDR)",
-            3: "重度非增殖性糖尿病视网膜病变(Severe NPDR)", 4: "增殖性糖尿病视网膜病变(PDR)"
+            3: "重度非增殖性糖尿病视网膜病变(Severe NPDR)",
+            4: "增殖性糖尿病视网膜病变(PDR)"
         }
         self.lesion_map = {
             'EX': '硬性渗出', 'HE': '视网膜出血', 'MA': '微血管瘤',
@@ -42,31 +44,46 @@ class DRDataset(Dataset):
     def generate_text(self, row):
         rate = int(row['RATE'])
         present_lesions = []
-        # 注意：这里假设 CSV 列名和 lesion_map key 一致
+
+        # 收集该图片包含的所有病灶
         for col, cn_name in self.lesion_map.items():
-            if col in row and int(row[col]) == 1:
+            if col in row and pd.notna(row[col]) and int(row[col]) == 1:
                 present_lesions.append(cn_name)
 
+        # 临床报告的标准分级术语
+        grade_desc = self.grade_map.get(rate, "糖尿病视网膜病变")
+
+        # === 1. 正常样本 (Grade 0 - 强调阴性体征) ===
         if rate == 0:
             templates = [
-                "一张正常的眼底照片，视网膜结构清晰。",
-                "眼底图像显示无明显病变，视神经和黄斑结构正常。",
-                "健康的眼底图像，无糖尿病视网膜病变迹象。"
+                "影像所见：屈光间质清，视盘边界清楚、色淡红。视网膜血管走形大致正常，未见视网膜出血、渗出、微血管瘤或玻璃体混浊等异常病变。影像提示：正常眼底。",
+                "眼底彩色照相报告：视乳头正常，黄斑区中心凹反光可见。视网膜平伏，未见明显出血点、硬性渗出及玻璃体异常。诊断提示：未见明显糖尿病视网膜病变。",
+                "临床影像所见：眼底结构清晰，A/V比例大致正常，未见微血管瘤、软性渗出或玻璃体积血等病理改变。影像诊断：无明显眼底异常。"
             ]
             return random.choice(templates)
 
-        grade_desc = self.grade_map.get(rate, "糖尿病视网膜病变")
+        # === 2. 有明确病灶的样本 (Grade > 0 + 具体病灶) ===
         if present_lesions:
+            # 随机打乱病灶顺序，增加文本特征多样性
             random.shuffle(present_lesions)
             lesions_str = "、".join(present_lesions)
+
             templates = [
-                f"一张可见{lesions_str}的眼底照片，。",
-                f"一张主要病灶包含{lesions_str}的眼底照片。",
-                f"一张眼底照片，可见{lesions_str}病灶"
+                f"影像所见：眼底后极部及周边视网膜可见明显的{lesions_str}。影像提示：符合{grade_desc}的临床影像学表现。",
+                f"眼底彩色照相报告：视网膜血管及实质可见异常改变，局灶或散布有{lesions_str}等病理特征。诊断提示：{grade_desc}。",
+                f"临床影像所见：眼底图像异常，筛查可见{lesions_str}。影像诊断：提示为{grade_desc}。",
+                f"影像学特征描述：眼底存在明显病灶，主要阳性体征表现为{lesions_str}。结论提示：{grade_desc}。"
             ]
             return random.choice(templates)
+
+        # === 3. 只有分级，没有标注具体病灶的样本 (Grade > 0) ===
         else:
-            return f"一张{grade_desc}的眼底照片。"
+            templates = [
+                f"影像所见：眼底视网膜可见糖尿病视网膜病变相关病理改变。影像提示：{grade_desc}。",
+                f"眼底彩色照相报告：视网膜血管及组织形态异常，符合{grade_desc}的经典影像学特征。",
+                f"临床影像所见：综合眼底表现与体征，诊断提示为{grade_desc}。"
+            ]
+            return random.choice(templates)
 
     def __len__(self):
         return len(self.data)
@@ -82,22 +99,14 @@ class DRDataset(Dataset):
             print(f"Warning: Image {img_name} not found.")
             image = Image.new('RGB', (224, 224))
 
-        # 注意：我们在 __getitem__ 里不应用 transform，因为我们要保存原图（或Resize后的图）到 LMDB
-        # transform 留给训练时的 DataLoader 做
-
         text = self.generate_text(row)
-        return image, text # 返回 PIL Image 和 文本字符串
+        return image, text
+
 
 # ==========================================
 # 2. LMDB 转换函数
 # ==========================================
-
 def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
-    """
-    Args:
-        dataset: 你的 DRDataset 实例
-        output_path: 输出文件夹路径
-    """
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
@@ -107,7 +116,6 @@ def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
     if not os.path.exists(path_imgs): os.makedirs(path_imgs)
     if not os.path.exists(path_pairs): os.makedirs(path_pairs)
 
-    # 估算 LMDB 大小
     map_size = int(max_size_gb * 1024 * 1024 * 1024)
 
     env_imgs = lmdb.open(path_imgs, map_size=map_size)
@@ -120,14 +128,11 @@ def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
 
     sample_idx = 0
 
-    # 遍历 Dataset
     for idx in tqdm(range(len(dataset))):
         try:
-            # 获取数据 (PIL Image, Text String)
             image, text = dataset[idx]
 
-            # --- 1. 图片处理 ---
-            # 为了节省空间和 I/O，建议统一 Resize 到 256 或 512
+            # 统一 Resize 以节省空间
             image = image.resize((256, 256), Image.BICUBIC)
 
             # 转为 Base64 Bytes
@@ -135,23 +140,17 @@ def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
             image.save(buff, format="JPEG", quality=90)
             img_b64 = base64.urlsafe_b64encode(buff.getvalue())
 
-            # ★ 关键策略：构造左右眼对 ★
-            # 因为 RET-CLIP 要求双眼输入，我们复制一份
+            # 构造左右眼对
             img_pair_b64 = [img_b64, img_b64]
 
-            # 存入 imgs (Key: patient_id)
-            # 这里我们简单用 idx 作为 patient_id
             patient_id = idx
             txn_imgs.put(
                 key=f"{patient_id}".encode('utf-8'),
                 value=pickle.dumps(img_pair_b64)
             )
 
-            # --- 2. 文本处理 ---
-            # 存入 pairs (Key: sample_idx)
-            # 格式: (patient_id, text_id, raw_text)
+            # 文本处理
             pair_data = (patient_id, idx, text)
-
             txn_pairs.put(
                 key=f"{sample_idx}".encode('utf-8'),
                 value=pickle.dumps(pair_data)
@@ -169,8 +168,7 @@ def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
             print(f"Error processing index {idx}: {e}")
             continue
 
-    # 写入元数据
-    txn_imgs.put(b'num_images', str(sample_idx).encode('utf-8')) # 这里 image count 等于 sample count
+    txn_imgs.put(b'num_images', str(sample_idx).encode('utf-8'))
     txn_pairs.put(b'num_samples', str(sample_idx).encode('utf-8'))
 
     txn_imgs.commit()
@@ -179,26 +177,33 @@ def make_lmdb_from_dataset(dataset, output_path, max_size_gb=100):
     env_pairs.close()
     print(f"完成！LMDB 保存在: {output_path}")
 
-# ==========================================
-# 3. 运行配置 (请修改这里)
-# ==========================================
 
+# ==========================================
+# 3. 运行配置
+# ==========================================
 if __name__ == "__main__":
-    # --- 配置训练集 ---
-    train_csvs = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/train.csv",
-        "/storage/luozhongheng/luo/concept_base/concept_dataset/mfiddr/train.csv"]
-    train_imgs = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/process_image/",
-        "/storage/luozhongheng/luo/concept_base/concept_dataset/train_process/"]
+    train_csvs = [
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/train.csv",
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/mfiddr/train.csv"
+    ]
+    train_imgs = [
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/process_image/",
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/train_process/"
+    ]
 
     print("正在创建 Training LMDB...")
-    train_ds = DRDataset(train_csvs, train_imgs, img_ext='.jpg') # 确保后缀正确
-    make_lmdb_from_dataset(train_ds, "./lmdb_output/train_lmdb")
+    train_ds = DRDataset(train_csvs, train_imgs, img_ext='.jpg')
+    make_lmdb_from_dataset(train_ds, "./lmdb_output/train_lmdb_latest")
 
-    # --- 配置验证集 (如果有) ---
-    val_csvs = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/valid.csv",
-        "/storage/luozhongheng/luo/concept_base/concept_dataset/mfiddr/valid.csv"]
-    val_imgs = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/process_image",
-        "/storage/luozhongheng/luo/concept_base/concept_dataset/train_process/"]
+    val_csvs = [
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/valid.csv",
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/mfiddr/valid.csv"
+    ]
+    val_imgs = [
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/process_image",
+        "/storage/luozhongheng/luo/concept_base/concept_dataset/train_process/"
+    ]
+
     print("正在创建 Validation LMDB...")
     val_ds = DRDataset(val_csvs, val_imgs, img_ext='.jpg')
-    make_lmdb_from_dataset(val_ds, "./lmdb_output/val_lmdb")
+    make_lmdb_from_dataset(val_ds, "./lmdb_output/val_lmdb_latest")

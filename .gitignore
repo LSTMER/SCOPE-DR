@@ -1,0 +1,12 @@
+*.npz
+*.mdb
+*.pt
+*.pyc
+*.log
+*.txt
+*.json
+*.pth
+*.jpg
+*.png
+*.TTC
+*.npy

@@ -1,9 +1,9 @@
 #!/usr/bin/env
 
 # Guide:
-# This script supports distributed training on multi-gpu workers (as well as single-worker training). 
-# Please set the options below according to the comments. 
-# For multi-gpu workers training, these options should be manually set for each worker. 
+# This script supports distributed training on multi-gpu workers (as well as single-worker training).
+# Please set the options below according to the comments.
+# For multi-gpu workers training, these options should be manually set for each worker.
 # After setting the options, please run the script on each worker.
 # Command: bash run_scripts/muge_finetune_vit-b-16_rbt-base.sh ${DATAPATH}
 
@@ -28,7 +28,7 @@ train_data=${DATAPATH}/ # your datapath
 val_data=${DATAPATH}/ # your darapath
 
 # restore options
-resume= # your ckpt path to resume
+resume= "./RET_CLIP/checkpoint/res-clip.pt"
 reset_data_offset="--reset-data-offset"
 reset_optimizer="--reset-optimizer"
 # reset_optimizer=""
