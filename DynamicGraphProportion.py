@@ -7,21 +7,16 @@ class SpatialConceptGraph(nn.Module):
         super().__init__()
         self.num_concepts = num_concepts
         self.pool_size = pool_size
-        self.num_spatial_nodes = pool_size * pool_size
-        self.total_nodes = num_concepts * self.num_spatial_nodes
+        self.num_spatial_nodes = pool_size * pool_size  # 49
+        self.total_nodes = num_concepts * self.num_spatial_nodes  # 6 * 49 = 294
 
         # 1. 静态空间距离衰减矩阵 D (不参与学习)
-        D_X = self._build_spatial_distance(pool_size, sigma)
-        # pool_size = 7
-        # self.pool_size = 7
-        # self.D_X = self._build_spatial_distance(pool_size, sigma)
-        self.register_buffer('D_X', D_X)
+        Dxx = self._build_spatial_distance(pool_size, sigma)
+        self.register_buffer('Dxx', Dxx)
 
         # 2. 静态医学先验矩阵 P_static (不参与学习)
-        P_staticx = self._build_prior_matrix()
-        self.register_buffer('P_staticx', P_staticx)
-
-        self.P_static = self._build_prior_matrix()
+        P_staticxx = self._build_prior_matrix()
+        self.register_buffer('P_staticxx', P_staticxx)
 
         # 3. 半静态学习的核心：可学习的微调矩阵 P_delta
         # 初始化为全0，意味着训练初期完全依靠专家的 P_static
@@ -30,7 +25,8 @@ class SpatialConceptGraph(nn.Module):
         # 微调幅度锁 (控制模型最多偏离专家经验多少，0.2是一个适中的值)
         self.alpha = 0.2
 
-        # self.proj = nn.Linear(self.total_nodes, out_features)
+        # 融合更新率 (控制当前节点吸收多少外来信息)
+        self.beta = 0.5
 
     def _build_spatial_distance(self, size, sigma):
         coords = torch.arange(size, dtype=torch.float32)
@@ -41,101 +37,110 @@ class SpatialConceptGraph(nn.Module):
 
     def _build_prior_matrix(self):
         """医学先验连通性矩阵"""
-        """ 0:HE(出血), 1:EX(硬性渗出), 2:MA(微动脉瘤), 3:SE(软性渗出), 4:VHE(玻璃体出血), 5: VOP(玻璃体浑浊)
-            其中, HE, EX, SE 是负相关的通道 因此其传递给正相关通道时的应该是负数"""
+        # 定义病灶概念和其先验权重
+        # 0:HE, 1:EX, 2:MA, 3:SE, 4:VHE, 5:VOP
+        # 其中 HE, EX, SE 是负相关（抑制）的通道
         P = torch.zeros((6, 6))
-        P[0, 0] = 1
-        P[1, 1] = 1
-        P[2, 2] = 0.2
-        P[3, 3] = 1
-        P[4, 4] = 0.5
-        P[5, 5] = 1
 
-        P[1, 2] = -0.9
-        P[2, 1] = 0.1
+        # 自身传递
+        P[0, 0] = 1; P[1, 1] = 1; P[2, 2] = 0.5
+        P[3, 3] = 1; P[4, 4] = 1; P[5, 5] = 1
+        # 互斥逻辑
+        P[1, 2] = 0.6;      P[2, 1] = 0.1   # EX, MA
+        P[2, 0] = 0.1;      P[0, 2] = 0.6     # MA, HE
+        # P[0, 1] = 0.6;      P[1, 0] = 0.6   # HE, EX
+        P[5, 4] = 0.6;      P[4, 5] = 0.2   # VOP, VHE
+        P[0, 4] = -2                        # 出血概念抑制
 
-        P[2, 0] = 0.1
-        P[0, 2] = -0.8
-
-        P[0, 1] = 0.6
-        P[1, 0] = 0.6
-
-        P[5, 4] = 1
-        P[4, 5] = 0.1
-
-        P[5, 2] = -0.6
-
+        # 共同特征逻辑
         for i in [5]:
-            for j in [0, 1, 3]:
-                P[i, j] = 0.6
+            for j in [1, 2, 3]:
+                P[i, j] = -0.6
         return P
 
-    import torch
-    import torch.nn.functional as F
-
     def forward(self, x, lesion_logit):
-        # 1. 空间池化与展平 [B, 96]
         B, C, H, W = x.size()
-        x_pooled = F.adaptive_avg_pool2d(x, (self.pool_size, self.pool_size))
-        x_flat = x_pooled.reshape(B, -1)
 
-        confidence = torch.sigmoid(lesion_logit) # [B, 6]
-        c_nodes = confidence.unsqueeze(-1).expand(-1, -1, self.num_spatial_nodes).reshape(B, -1)
+        # 1. 基础映射：映射到 [0, 1] 概率空间
+        tau = 0.5
+        x_prob = torch.sigmoid(x / tau)
 
-        # ==================== 核心修改区：自身特征门控 ====================
+        # 空间池化 [B, 6, 7, 7]
+        x_pooled = F.adaptive_avg_pool2d(x_prob, (self.pool_size, self.pool_size))
 
-        # 2. 计算当前 forward 步的动态语义矩阵 P
-        P_current = self.P_static.to(x.device) + self.alpha * torch.tanh(self.P_delta)
+        # 展平为 [B, 6, 49] 以便进行单通道(单病灶)的空间统计
+        x_spatial = x_pooled.view(B, self.num_concepts, -1)
 
-        # D = self.D_X.to(x.device)
+        # ==================== 🌟 你的新思路：动态均值截断 ====================
+        # 计算每张图、每种病灶的空间均值 [B, 6, 1]
+        spatial_mean = x_spatial.mean(dim=-1, keepdim=True)
 
-        # 3. 极速生成 96x96 的终极联合邻接矩阵 A
-        A = torch.kron(P_current, self.D_X)
+        # ==================== 🌟 核心修改：正负通道差异化剥离 ====================
+        x_salient = torch.zeros_like(x_spatial)
 
-        degree = torch.sum(torch.abs(A), dim=1, keepdim=True) + 1e-8
+        # 定义通道索引
+        pos_idx = [0, 2, 4, 5]  # 正向响应通道：分数越高，病灶越强
+        inv_idx = [1, 3]  # 倒置响应通道：分数越低，病灶越强
 
-        # 归一化邻接矩阵 A -> A_norm
-        # 现在 A_norm 中每一行的绝对值加起来刚好等于 1.0！
-        A_norm = A / degree
+        # A. 正向通道剥离 (保留高于均值的部分)
+        x_salient[:, pos_idx, :] = F.relu(x_spatial[:, pos_idx, :] - spatial_mean[:, pos_idx, :])
 
-        # 3. 极简的图信息传递 (真正的加权平均！)
-        # 因为 A_norm 已经包含了对角线(自身)且归一化了，所以出来的直接就是完美平衡的特征
-        node_mixed = torch.matmul(x_flat, A_norm)
-
-        # print(P_current)
-
-        # 🌟 核心改进：三次方自门控 (Self-Gating)
-        # 只有响应足够强烈（激活度高）的节点，才有资格大声说话
-        # 极其微小的响应（如0.1~0.3）被三次方后几乎归零，防止了信息洪流污染背景
-        # 结合 Tanh 将广播能量软性锁死在 [-1, 1] 之间，同时保留三次方压制小数值的特性
-        # x_broadcast = x_flat * torch.pow(torch.tanh(x_flat), 2) * c_nodes
-
-        # # 4. 图信息传递 (Message Passing) - 传递的是门控过滤后的信息
-        # influence = torch.matmul(x_broadcast, A)
-
+        # B. 倒置通道剥离与翻转 (保留低于均值的部分，并将其翻转为高亮)
+        # 极其优雅的数学转换：既然越低越有病，我们就用 (均值 - 当前值)
+        # 这样原本最低的值（最强病灶）会变成最大的正数！
+        x_salient[:, inv_idx, :] = F.relu(spatial_mean[:, inv_idx, :] - x_spatial[:, inv_idx, :])
         # ====================================================================
 
-        # # 5. 动态保留机制 (保护原图自身特征)
-        # # 根据外来影响的大小，决定坚守多少自我
-        # alpha_keep = torch.clamp(1.0 / (torch.abs(influence) + 1e-5), max=1.0)
-        # node_mixed = influence
+        # 此时的 x_salient 已经彻底统一了量纲：无论哪个通道，【值越大，就代表病灶越确定】
+        x_flat_salient = x_salient.reshape(B, -1)
+        # ====================================================================
 
-        # ================= 6. 解码与池化融合 =================
-        # 解包回 6x4x4
+        # 2. 全局疾病门控 (保持不变，用图像级分类概率进一步压制)
+        # confidence = torch.sigmoid(lesion_logit)
+        # c_nodes = confidence.unsqueeze(-1).expand(-1, -1, self.num_spatial_nodes).reshape(B, -1)
+
+        # 此时的 x_gated 已经是：既剥离了空间底噪，又受全局患病概率控制的极度纯净的特征！
+        x_gated = x_flat_salient
+
+        # P = self._build_prior_matrix()
+
+        # 3. 图构建与归一化 + self.alpha * torch.tanh(self.P_delta)
+        P_current = self.P_staticxx.to(x.device) + self.alpha * torch.tanh(self.P_delta)
+        # print(self.P_staticx)
+        # print(P_current)
+
+        A = torch.kron(P_current, self.Dxx.to(x.device))
+        # print(A)
+
+        # degree = torch.sum(torch.abs(A), dim=1, keepdim=True) + 1e-8
+        # A_norm = A / degree
+
+        # 4. 传递受控的干净信息
+        message = torch.matmul(x_gated, A)
+
+        # 5. 凸组合与托底
+        # 注意：本体保留的是最原始的 x_pooled展平(可选)，或者是截断后的 x_gated
+        # 建议本体也使用截断后的 x_gated，这样原本的背景噪点也能被彻底消除
+        # node_mixed = (1.0 - self.beta) * x_gated + self.beta * message
+        node_mixed = F.relu(message)
+
+        # 6. 解码与上采样
         x_graph_spatial = node_mixed.view(B, self.num_concepts, self.pool_size, self.pool_size)
-        # print(x_graph_spatial)
 
-        # 直接双线性插值上采样到 6x14x14
-        x_upsampled = F.interpolate(x_graph_spatial, size=(H, W), mode='bilinear', align_corners=False)
+        # ==================== 🌟 核心还原：出图前翻转回倒置状态 ====================
+        x_graph_spatial = node_mixed.view(B, self.num_concepts, self.pool_size, self.pool_size)
 
-        # 简单粗暴叠加！你加的 * 0.1 非常好，作为残差缩放防止图特征喧宾夺主
-        out = x_upsampled
+        x_graph_spatial_out = x_graph_spatial.clone()
+        # 把原本是倒置的通道，再用 1.0 减去，恢复成“越低越是病灶”的原始状态！
+        x_graph_spatial_out[:, inv_idx, :, :] = -x_graph_spatial[:, inv_idx, :, :]
 
-        # 全局统计池化 (提取用于分类头的 18 维特征)
-        g_mean = x_graph_spatial.mean(dim=(2, 3))  # [B, 6]
-        g_max = x_graph_spatial.amax(dim=(2, 3))   # [B, 6]
-        g_min = x_graph_spatial.amin(dim=(2, 3))   # [B, 6]
+        out = F.interpolate(x_graph_spatial_out, size=(H, W), mode='bilinear', align_corners=False)
 
-        graph_features_pooled = torch.cat([g_mean, g_max, g_min], dim=1) # [B, 18]
+        # 7. 提取图特征用于分类头
+        g_mean = x_graph_spatial_out.mean(dim=(2, 3))
+        g_max = x_graph_spatial_out.amax(dim=(2, 3))
+        g_min = x_graph_spatial_out.amin(dim=(2, 3))
+
+        graph_features_pooled = torch.cat([g_mean, g_max, g_min], dim=1)
 
         return graph_features_pooled, out

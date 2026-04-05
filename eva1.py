@@ -28,7 +28,7 @@ except ImportError:
 # 你的 LMDB 路径 (最好是验证集的 LMDB)
 LMDB_PATH = "./lmdb_output/val_lmdb"
 MODEL_PATH = "/storage/luozhongheng/luo/concept_base/RET-CLIP/RET_CLIP/checkpoint/ret-clip.pt"
-LORA_PATH = "/storage/luozhongheng/luo/concept_base/RET-CLIP/checkpoints/finetuned_model_x/dr_grading_finetune/checkpoints/epoch2.pt"
+LORA_PATH = "/storage/luozhongheng/luo/concept_base/RET-CLIP/checkpoints/finetuned_model_x/dr_grading_finetune/checkpoints/epoch1.pt"
 # MODEL_PATH = "/storage/luozhongheng/luo/concept_base/RET-CLIP/checkpoints/finetuned_model_x/dr_grading_finetune/checkpoints/epoch_4.pt"
 BATCH_SIZE = 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -143,12 +143,26 @@ class LMDBEvalDataset(Dataset):
 # === 4. 评估逻辑 ===
 from utils import load_ret_clip_with_lora
 def evaluate():
-    model = load_ret_clip_with_lora(
-        base_model_path=MODEL_PATH,
-        lora_weight_path=LORA_PATH,
-        device=DEVICE,  # 自动挂载到显卡
-        verbose=True    # 开启打印，看着放心
-    )
+    raw_ckpt = torch.load(MODEL_PATH, map_location="cpu")
+
+    if isinstance(raw_ckpt, dict):
+        if "state_dict" in raw_ckpt:
+            clean_checkpoint = raw_ckpt
+        elif "model" in raw_ckpt:
+            clean_checkpoint = {"state_dict": raw_ckpt["model"]}
+        else:
+            clean_checkpoint = {"state_dict": raw_ckpt}
+    else:
+        raise ValueError("错误: 基础权重文件格式不对 (不是字典)")
+
+    # 创建基础模型
+    model = create_model("ViT-B-16@RoBERTa-wwm-ext-base-chinese", checkpoint=clean_checkpoint)
+    for param in model.parameters():
+        param.requires_grad = False
+
+    model = model.float()
+    model.to(DEVICE)
+    model.eval()
 
     tokenizer = BertTokenizer.from_pretrained("./tokenizer_files")
     # --- 预计算文本特征 ---
@@ -212,11 +226,11 @@ def evaluate():
     gt = np.concatenate(res_lesion_gt, axis=0)
 
     # 2. 保存为本地文件 (指定路径)
-    save_path = "eval_results.npz"
+    save_path = "eval_results_origin.npz"
     np.savez(save_path, scores=scores, gt=gt)
     print(f"\n[Info] Raw results saved to {save_path}")
 
-def visualize(data_path="eval_results.npz"):
+def visualize(data_path="eval_results_origin.npz"):
     data = np.load(data_path)
     scores = data['scores']
     gt = data['gt']
@@ -431,7 +445,7 @@ if __name__ == "__main__":
     evaluate()
 
     # 如果你只想调绘图参数：
-    visualize("eval_results.npz")
+    visualize("eval_results_origin.npz")
 
 # if __name__ == "__main__":
 #     evaluate()

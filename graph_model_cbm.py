@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from RET_CLIP.clip.utils import create_model
-from GraphPorprogration import SpatialConceptGraph
+from DynamicGraphProportion import SpatialConceptGraph
 
 class SALF_CBM(nn.Module):
     def __init__(self, checkpoint_path, concepts, device='cuda'):
@@ -41,31 +41,24 @@ class SALF_CBM(nn.Module):
         # ★★★ 关键步骤：用文本特征初始化投影层 ★★★
         self._initialize_projector_with_text()
 
-        self.graph_out_dim = 64 # 图特征压缩到 64 维
+        self.graph_output = 18
         self.spatial_graph = SpatialConceptGraph(
             num_concepts=6,
-            pool_size=4,
-            out_features=self.graph_out_dim
+            pool_size=7
         ).to(device)
-
-        for param in self.spatial_graph.parameters():
-            param.requires_grad = False
 
         # ==========================================
         # ★★★ 核心修改：混合特征维度 (Hybrid Dimensions) ★★★
         # ==========================================
         # 概念特征维度: 6个概念 * 3种池化(Mean, Max, Min) = 18维
+        # 图特征压缩到 64 维 64 + 18 = 82
         concept_dim = self.num_concepts * 3
-        # 全局原始特征维度: CLIP ViT-B 默认输出 768维
-        # global_dim = 6*14*14
-        # 融合后的总维度: 18 + 768 = 786维
-        fused_dim = concept_dim + self.graph_out_dim
+        fused_dim = concept_dim + self.graph_output
 
-        # 3. Main Head (DR Grading) -> 接收 786 维的融合特征
-        self.headx = nn.Linear(fused_dim, 5)
+        self.headx = nn.Linear(concept_dim, 5)
         self.headx.to(device)
 
-        # 4. Auxiliary Head (Lesion Classification) -> 依然只接收 18 维的概念特征
+        # 4. Auxiliary Head (Lesion Classification) -> 依然只接收 18 维的概念特征 用于约束 projection 的训练
         self.aux_head = nn.Sequential(
             nn.Linear(concept_dim, 64),
             nn.ReLU(),
@@ -73,20 +66,22 @@ class SALF_CBM(nn.Module):
         )
         self.aux_head.to(device)
 
-        # 冻结基础映射层
-        for param in self.concept_projector.parameters():
-            param.requires_grad = False
-
-        # 解冻图网络
-        for param in self.spatial_graph.parameters():
-            param.requires_grad = True
-
-        # 新增一个专门用于病灶预测的分类头
+        # 新增一个专门用于病灶预测的分类头，用于约束训练 graph 图网络层
         self.lesion_head = nn.Sequential(
             nn.Linear(fused_dim, 64),
             nn.ReLU(),
             nn.Linear(64, self.num_concepts) # 输出 6 个病灶的概率
         ).to(device)
+
+        #
+        # final_dim = fused_dim + 768
+        final_dim = fused_dim
+        self.final_headx = nn.Linear(final_dim, 5)
+        self.final_headx.to(device)
+
+        # self.fh = nn.Linear(768, 5)
+        # self.fh.to(device)
+
 
     def _initialize_projector_with_text(self):
         """
@@ -149,37 +144,41 @@ class SALF_CBM(nn.Module):
             x = x.permute(0, 2, 1).reshape(B, D, H, W)
 
         # --- 2. 提取特征 ---
-
-        # A. 提取全局原始特征 (Global Average Pooling) -> [B, 768]
-        global_features = x.mean(dim=(2, 3))
-
         # B. 提取概念特征 (Concept Maps & Pooling)
         concept_maps = self.concept_projector(x) # [B, 6, 14, 14]
         c_mean = concept_maps.mean(dim=(2, 3))   # [B, 6]
         c_max = concept_maps.amax(dim=(2, 3))    # [B, 6]
         c_min = concept_maps.amin(dim=(2, 3))    # [B, 6]
 
+        global_features = x.mean(dim=(2, 3))
+
         # C. 拼接概念特征 -> [B, 18]
         concept_features = torch.cat([c_mean, c_max, c_min], dim=1)
 
-        # D. ★ 混合拼接 (Hybrid Fusion) ★ -> [B, 786]
-        # fused_features = torch.cat([concept_features, global_features], dim=1)
+        # 辅助分类头只接收概念特征 (18维)，保证 Stage 1 逻辑不受影响，用于约束 projection 训练
+        lesion_logits_aux = self.aux_head(concept_features)
 
-        # fused_features = torch.cat([torch.flatten(concept_maps, start_dim=1, end_dim=-1), concept_features], dim=1)
-        with torch.no_grad():
-            graph_features = self.spatial_graph(concept_maps) # [B, 64]
+        # D. 获取图推理特征
+        graph_features, after_graph_map = self.spatial_graph(concept_maps, lesion_logits_aux) # [B, 64]
 
-        # --- 3. 分类头预测 --- 18 + 64 = 82
+        # F. 图推理特征联合初始概念池化特征
         fused_features = torch.cat([concept_features, graph_features], dim=1)
-        # 主分级头接收融合特征 (786维)
-        grade_logits = self.headx(fused_features)
 
-        # 辅助分类头只接收概念特征 (18维)，保证 Stage 1 逻辑不受影响
-        lesion_logits = self.aux_head(concept_features)
+        # 主分级头接收融合特征 (82维)
+        grade_logits = self.headx(concept_features)
 
+
+        # grade_logits_final = self.fh(global_features)
+
+        # 最终概念分类头接收概念特征（18维）和图推理特征（64维）约束图推理参数训练
         lesion_logits_graph = self.lesion_head(fused_features) # [B, 6]
 
-        return grade_logits, concept_maps, lesion_logits, lesion_logits_graph
+        # 最终分类头接收概念特征（18维）和图推理特征（18维）
+        global_features = x.mean(dim=(2, 3))
+        final_concept = torch.cat([fused_features], dim=1)
+        grade_logits_final = self.final_headx(final_concept)
+
+        return grade_logits, concept_maps, lesion_logits_aux, lesion_logits_graph, grade_logits_final, after_graph_map
 
 # === 测试代码 ===
 if __name__ == "__main__":

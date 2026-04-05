@@ -2,112 +2,94 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SignedGraphReasoning(nn.Module):
+class SpatialConceptGraph(nn.Module):
     """
-    基于临床先验与高斯空间衰减的符号化动态图推理模块
+    优化的空间-语义联合图推理模块
+    将输入图池化为小尺寸(如4x4)，对每个空间网格进行跨概念的图消息传递
     """
-    def __init__(self, num_nodes=6, spatial_size=14, out_features=128, sigma=2.0, lambda_prior=0.1):
+    def __init__(self, num_concepts=6, pool_size=4, sigma=1.0, out_features=64):
         super().__init__()
-        self.num_nodes = num_nodes
-        self.spatial_size = spatial_size
-        self.in_features = spatial_size * spatial_size # 展平后的维度 14*14 = 196
-        self.out_features = out_features
-        self.lambda_prior = lambda_prior
+        self.num_concepts = num_concepts
+        self.pool_size = pool_size
+        self.num_spatial_nodes = pool_size * pool_size  # 例如 4x4 = 16
+        self.total_nodes = num_concepts * self.num_spatial_nodes # 例如 6x16 = 96
 
-        # 1. 预计算高斯距离惩罚常数矩阵 (196 x 196)
-        # 使用 register_buffer，这样它会被视为模型状态，自动跟随模型存入 GPU，但不参与梯度更新
-        G = self._build_gaussian_kernel(spatial_size, sigma)
-        self.register_buffer('G', G)
+        # 1. 预计算 16x16 的空间距离衰减矩阵 D
+        D = self._build_spatial_distance(pool_size, sigma)
 
-        # 2. 构建临床医学先验矩阵 (6 x 6)
-        # 将其设置为 nn.Parameter，意味着以医学先验作为初始值，允许模型在训练中微调这个关系！
+        # 2. 获取 6x6 的医学先验矩阵 P
         P = self._build_prior_matrix()
-        self.P = nn.Parameter(P)
 
-        # 3. 图卷积节点特征更新层
-        # 用于将融合后的 196 维特征映射为你需要的输出维度（如 128 或其他）
-        self.W = nn.Linear(self.in_features, out_features)
+        # 3. 构建 96x96 的终极联合邻接矩阵 A
+        # A[i, j] 包含了概念先验和空间距离的双重约束
+        A = self._build_joint_adjacency(P, D)
+        self.register_buffer('A', A) # 作为静态矩阵存入模型，暂时不参与训练
 
-    def _build_gaussian_kernel(self, size, sigma):
-        """生成物理空间的二维高斯距离衰减矩阵"""
+        # 4. 降维映射层 (将 96 维的图特征压缩，防止在拼接时喧宾夺主)
+        self.proj = nn.Linear(self.total_nodes, out_features)
+
+    def _build_spatial_distance(self, size, sigma):
+        """生成 16x16 的空间高斯距离矩阵"""
         coords = torch.arange(size, dtype=torch.float32)
         y, x = torch.meshgrid(coords, coords, indexing='ij')
-        # 构建所有像素点的网格坐标 (196, 2)
         grid = torch.stack([y.flatten(), x.flatten()], dim=1)
-        # 计算任意两点之间的欧式距离平方 (196, 196)
         dist_sq = torch.cdist(grid, grid, p=2)**2
-        # 应用高斯衰减公式
-        G = torch.exp(-dist_sq / (2 * sigma**2))
-        return G
+        return torch.exp(-dist_sq / (2 * sigma**2))
 
     def _build_prior_matrix(self):
-        """
-        手工设定先验连通性矩阵
-        节点顺序约定: 0:HE(出血), 1:EX(硬性渗出), 2:MA(微动脉瘤), 3:SE(软性渗出), 4:VOP(玻璃体浑浊), 5:VHE(玻璃体出血)
-        """
-        P = torch.ones((6, 6)) * 0.1  # 基础微弱正相关
-        P.fill_diagonal_(1.0)         # 自身到自身的权重为 1
-
-        # 【正相关】：MA(2) 和 EX(1) (环形渗出包裹)
-        P[2, 1] = P[1, 2] = 0.9
-        # 【正相关】：MA(2) 和 HE(0) (破裂出血)
-        P[2, 0] = P[0, 2] = 0.8
-        # 【正相关】：EX(1) 和 SE(3) (中重度区域共现)
-        P[1, 3] = P[3, 1] = 0.5
-        # 【正相关】：VOP(4) 和 VHE(5)
-        P[4, 5] = P[5, 4] = 0.8
-
-        # 【强负相关】：VOP(4)及VHE(5) 遮挡 所有视网膜表面病灶(0, 1, 2, 3)
+        """医学先验连通性矩阵 (0:HE, 1:EX, 2:MA, 3:SE, 4:VOP, 5:VHE)"""
+        P = torch.ones((6, 6)) * 0.1
+        P.fill_diagonal_(1.0)
+        # 正相关示例
+        P[2, 1] = P[1, 2] = 0.9  # MA & EX
+        P[2, 0] = P[0, 2] = 0.8  # MA & HE
+        P[4, 5] = P[5, 4] = 0.8  # VOP & VHE
+        # 负向遮挡示例
         for i in [4, 5]:
             for j in [0, 1, 2, 3]:
-                P[i, j] = P[j, i] = -0.4
-
+                P[i, j] = -0.8
         return P
 
+    def _build_joint_adjacency(self, P, D):
+        """
+        核心逻辑：组合空间与先验
+        对于任意概念 c1 的位置 p1，与概念 c2 的位置 p2 之间的关联强度为：P[c1, c2] * D[p1, p2]
+        """
+        A = torch.zeros(self.num_concepts, self.num_spatial_nodes,
+                        self.num_concepts, self.num_spatial_nodes)
+
+        for c1 in range(self.num_concepts):
+            for c2 in range(self.num_concepts):
+                # 如果这两个病灶在医学上正相关，且当前这两个节点在空间上很近(D很大)
+                # 那么它们之间的边权重就会非常大！
+                A[c1, :, c2, :] = P[c1, c2] * D
+
+        # 展平为 [96, 96] 的矩阵
+        return A.view(self.total_nodes, self.total_nodes)
+
     def forward(self, x):
-        B, C, H, W = x.shape
-        assert C == self.num_nodes
+        """
+        x: [B, 6, 14, 14] 的概念热力图
+        """
+        # 1. 空间池化降维 (14x14 -> 4x4)
+        x_pooled = F.adaptive_avg_pool2d(x, (self.pool_size, self.pool_size)) # [B, 6, 4, 4]
 
-        # 展平特征 [B, 6, 196]
-        x_flat = x.view(B, C, -1)
+        # 2. 展平为节点特征向量 [B, 96]
+        x_flat = x_pooled.reshape(x.size(0), -1)
 
-        # ==========================================
-        # 🌟 修复 1：空间尺度正则化 (Spatial Min-Max Normalization)
-        # 解决量纲爆炸问题，把所有特征强制拉平到 [0, 1] 区间
-        # ==========================================
-        x_min = x_flat.min(dim=-1, keepdim=True)[0]
-        x_max = x_flat.max(dim=-1, keepdim=True)[0]
-        # 加 1e-8 防止除以 0 导致 NaN
-        x_norm = (x_flat - x_min) / (x_max - x_min + 1e-8)
+        # 3. 静态图信息传递 (Message Passing) 与 动态保留机制
+        # 3.1 获取外来的影响信息 (Message)
+        influence = torch.matmul(x_flat, self.A.t()) # [B, 96]
 
-        # ==========================================
-        # 🌟 修复 2：反向特征的绝对语义翻转 (Semantic Alignment)
-        # 解决语义偏移问题，让所有通道统一为 "越大代表病灶越严重"
-        # ==========================================
-        x_aligned = x_norm.clone()
-        # VOP(4) 和 VHE(5) 是反向特征（原值越大越健康）
-        # 1.0 - x 将它们翻转，现在 1.0 代表极度浑浊/出血，0.0 代表清澈！
-        x_aligned[:, 1, :] = 1.0 - x_norm[:, 1, :]
-        x_aligned[:, 3, :] = 1.0 - x_norm[:, 3, :]
-        x_aligned[:, 5, :] = 1.0 - x_norm[:, 5, :]
+        # 3.2 计算动态保留系数 alpha (限制最大值为1.0，加上1e-5防止除零)
+        # 取绝对值是因为负数的影响(强抑制)同样也是一种强影响
+        alpha = torch.clamp(1.0 / (torch.abs(influence) + 1e-5), max=1.0)
 
-        # === 重新计算空间共现矩阵 S ===
-        # 使用对齐后的特征计算，并加上一个温度系数 5.0 让高激活区更锐利
-        x_attn = F.softmax(x_aligned * 5.0, dim=-1)
-        temp = torch.matmul(x_attn, self.G)
-        S = torch.matmul(temp, x_attn.transpose(-2, -1))
+        # 3.3 融合：(动态缩放的原特征) + (接收到的影响信息)
+        node_mixed = alpha * x_flat + influence
 
-        # === 生成最终符号邻接矩阵 A ===
-        A = self.P * S + self.lambda_prior * self.P
+        # 4. 激活与降维压缩
+        node_activated = F.leaky_relu(node_mixed, negative_slope=0.2)
+        graph_features = self.proj(node_activated) # [B, 64]
 
-        # ==========================================
-        # 🌟 修复 3：安全的信息传递 (Message Passing)
-        # 使用对齐且归一化后的 x_aligned 参与乘法，绝对不会梯度爆炸！
-        # ==========================================
-        node_mixed = torch.matmul(A, x_aligned)
-
-        # 映射特征并使用 LeakyReLU 保留负向遮挡信号
-        out_features = self.W(node_mixed)
-        node_embeddings = F.leaky_relu(out_features, negative_slope=0.2)
-
-        return node_embeddings, A
+        return graph_features

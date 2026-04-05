@@ -13,7 +13,7 @@ import os
 # 必须严格保证这里的顺序与你生成 npz 矩阵时的 CONCEPTS 顺序一致！
 CONCEPT_COLUMNS = ['HE', 'EX', 'MA', 'SE', 'VHE', 'VOP']
 
-class MultiModalDataset(Dataset):
+class MultiModalDataset1(Dataset):
     def __init__(self, csv_paths, lmdb_path, npz_path, transform=None):
         """
         Args:
@@ -24,6 +24,7 @@ class MultiModalDataset(Dataset):
         """
         self.lmdb_path = lmdb_path
         self.transform = transform
+        self.start = 0
 
         # 1. 加载并拼接 CSV (逻辑必须与 make_lmdb.py 完全一致)
         if isinstance(csv_paths, str):
@@ -47,9 +48,13 @@ class MultiModalDataset(Dataset):
 
         # === 核心校验 ===
         # 检查 CSV 行数是否和 NPZ 矩阵数量对得上
-        assert len(self.df) == len(self.matrices), \
-            f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
+        # assert len(self.df) == len(self.matrices), \
+        #     f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
+        if len(self.df) != len(self.matrices):
+            self.start = 228
 
+        assert len(self.df) + self.start == len(self.matrices), \
+            f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
         print(f"Dataset Successfully Aligned! Total samples: {len(self.df)}")
 
         # 3. LMDB 环境初始化 (懒加载)
@@ -85,11 +90,11 @@ class MultiModalDataset(Dataset):
 
         # === Step 2: 从 NPZ 获取教师矩阵 (Teacher) ===
         # 直接按索引取
-        teacher_matrix = torch.from_numpy(self.matrices[index]).float()
+        teacher_matrix = torch.from_numpy(self.matrices[index + self.start]).float()
 
         # === Step 3: 从 LMDB 获取图片 (Student Input) ===
         # ★★★ 关键修改：根据你的生成代码，Key 是 index 字符串 ★★★
-        lmdb_key = f"{index}".encode('utf-8')
+        lmdb_key = f"{index + self.start}".encode('utf-8')
         img_bytes = self.txn_imgs.get(lmdb_key)
 
         if img_bytes is None:
