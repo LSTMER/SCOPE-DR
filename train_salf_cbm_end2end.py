@@ -28,8 +28,7 @@ class Config:
     TRAIN_NPZ  = "train_concept_matrices_latest_model.npz"
 
     # 验证集的 CSV 列表
-    VAL_CSVS   = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/valid.csv",
-        "/storage/luozhongheng/luo/concept_base/concept_dataset/mfiddr/valid.csv"] # 或者是测试集
+    VAL_CSVS   = ["/storage/luozhongheng/luo/concept_base/concept_dataset/new_dataset/concept_annotation/split/valid.csv"] # 或者是测试集
     VAL_LMDB   = "./lmdb_output/val_lmdb"
     VAL_NPZ    = "train_concept_matrices_latest_model_val.npz"
 

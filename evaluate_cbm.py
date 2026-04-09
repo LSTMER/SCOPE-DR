@@ -13,7 +13,7 @@ from sklearn.preprocessing import label_binarize
 
 # === 导入你的模块 ===
 
-from MultiModalDataset import MultiModalDataset, CONCEPT_COLUMNS
+from MultiModalDataset1 import MultiModalDataset1, CONCEPT_COLUMNS
 from graph_model_cbm import SALF_CBM
 from train_salf_cbm_end2end import SmartFundusCrop, Config # 复用之前的配置
 
@@ -29,8 +29,13 @@ class EvalConfig(Config):
     CHECKPOINT_PATH3 = "checkpoints/salf_cbm_graph_epoch1/save_graph_model_stage3.pth"
     CHECKPOINT_PATH4 = "checkpoints/salf_cbm_final_for_graph_moreEpoch/save_graph_model_stage5.pth"
     CHECKPOINT_PATH6 = "checkpoints/salf_cbm_graph_epoch1/save_graph_model_stage6.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion/stage4_final.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_new/stage1_fusion_aux.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_aa/stage4_final.pth"
+    # FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_ex/stage4_final.pth"
 
-    SAVE_DIR_VIS    = "evaluation_results/visualizations_new_1"
+
+    SAVE_DIR_VIS    = "evaluation_results/visualizations_new_2"
     NUM_VIS_SAMPLES = 5  # 随机挑几张图画热力图
 
 # ==========================================
@@ -728,8 +733,8 @@ def visualize_grid_overlays_by_grade_compare(model, dataset, samples_per_grade, 
             # 翻转负相关通道
             for maps_vis in [maps_pre, maps_post]:
                 for c_idx, concept in enumerate(concepts):
-                    if concept in invert_concepts:
-                        maps_vis[c_idx] = -maps_vis[c_idx]
+                    # if concept in invert_concepts:
+                    #     maps_vis[c_idx] = -maps_vis[c_idx]
                     if concept in ["VOP"]:
                         # 获取当前通道的最大值和最小值
                         c_max = maps_vis[c_idx].max()
@@ -821,7 +826,7 @@ def main():
         Normalize((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
     ])
 
-    val_dataset = MultiModalDataset(
+    val_dataset = MultiModalDataset1(
         csv_paths=cfg.VAL_CSVS,
         lmdb_path=cfg.VAL_LMDB,
         npz_path=cfg.VAL_NPZ,
@@ -832,10 +837,12 @@ def main():
 
     # 2. 初始化模型并加载权重
     # print("Loading Model Architecture and Weights...")
-    model = SALF_CBM(checkpoint_path=cfg.BACKBONE_PATH, concepts=cfg.CONCEPTS, device=cfg.DEVICE)
+    # model = SALF_CBM(checkpoint_path=cfg.BACKBONE_PATH, concepts=cfg.CONCEPTS, device=cfg.DEVICE)
+    from graph_model_cbm_fusion_v2 import SALF_CBM_Fusion
+    model = SALF_CBM_Fusion(checkpoint_path=cfg.BACKBONE_PATH, concepts=cfg.CONCEPTS, device=cfg.DEVICE)
     model.to(cfg.DEVICE)
 
-    checkpoint = torch.load(cfg.CHECKPOINT_PATH6, map_location=cfg.DEVICE)
+    checkpoint = torch.load(cfg.FUSION_CHECKPOINT, map_location=cfg.DEVICE)
     model.load_state_dict(checkpoint, strict=False)
     print("✅ Weights successfully loaded!")
 

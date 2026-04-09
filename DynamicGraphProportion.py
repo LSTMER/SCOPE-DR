@@ -58,7 +58,7 @@ class SpatialConceptGraph(nn.Module):
                 P[i, j] = -0.6
         return P
 
-    def forward(self, x, lesion_logit):
+    def forward(self, x):
         B, C, H, W = x.size()
 
         # 1. 基础映射：映射到 [0, 1] 概率空间

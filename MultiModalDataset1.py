@@ -50,12 +50,12 @@ class MultiModalDataset1(Dataset):
         # 检查 CSV 行数是否和 NPZ 矩阵数量对得上
         # assert len(self.df) == len(self.matrices), \
         #     f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
-        if len(self.df) != len(self.matrices):
-            self.start = 228
+        # if len(self.df) != len(self.matrices):
+        #     self.start = 228
 
-        assert len(self.df) + self.start == len(self.matrices), \
-            f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
-        print(f"Dataset Successfully Aligned! Total samples: {len(self.df)}")
+        # assert len(self.df) + self.start == len(self.matrices), \
+        #     f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
+        # print(f"Dataset Successfully Aligned! Total samples: {len(self.df)}")
 
         # 3. LMDB 环境初始化 (懒加载)
         self.env_imgs = None
