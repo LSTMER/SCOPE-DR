@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import random
+import argparse
 from tqdm import tqdm
 from sklearn.metrics import (
     f1_score,
@@ -46,18 +47,40 @@ class EvalConfig(Config):
     CHECKPOINT_PATH4 = (
         "checkpoints/salf_cbm_final_for_graph_moreEpoch/save_graph_model_stage5.pth"
     )
-    FUSION_CHECKPOINT = "checkpoints/salf_cbm_graph_epoch1/save_graph_model_stage6.pth"
-    # FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion/stage4_final.pth"
-    # FUSION_CHECKPOINT = (
-    #     "./checkpoints/ablation_auto_mifddr_latest/full/stage4_final.pth"
-    # )
-    # FUSION_CHECKPOINT = "./checkpoints/ablation_auto_mifddr/full/stage4_final.pth"
-
-    # FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_aa/stage4_final.pth"
+    CHECKPOINT_PATH6 = "checkpoints/salf_cbm_graph_epoch1/save_graph_model_stage6.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion/stage4_final.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_new/stage1_fusion_aux.pth"
+    FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_aa/stage4_final.pth"
+    FUSION_CHECKPOINT = (
+        "./checkpoints/ablation_auto_mifddr_latest/full/stage4_final.pth"
+    )
     # FUSION_CHECKPOINT = "./checkpoints/salf_cbm_fusion_ex/stage4_final.pth"
 
-    SAVE_DIR_VIS = "evaluation_results/visualizations_new_2"
+    SAVE_DIR_VIS = "evaluation_results/visualizations_new_3"
     NUM_VIS_SAMPLES = 5  # 随机挑几张图画热力图
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate SALF_CBM_Fusion with ablation settings."
+    )
+    # 与训练保持一致: vit_direct(0), cp(1), cp_graph(2), full(3)
+    parser.add_argument(
+        "--ablation-stage",
+        type=str,
+        default="full",
+        choices=["vit_direct", "vit", "0", "cp", "cp_graph", "full", "1", "2", "3"],
+        help="Ablation stage used to build the model.",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="Override fusion checkpoint path."
+    )
+    parser.add_argument(
+        "--skip-visualization",
+        action="store_true",
+        help="Only run metrics, skip plot generation.",
+    )
+    return parser.parse_args()
 
 
 # ==========================================
@@ -892,8 +915,8 @@ def visualize_grid_overlays_by_grade_compare(
             # 翻转负相关通道
             for maps_vis in [maps_pre, maps_post]:
                 for c_idx, concept in enumerate(concepts):
-                    if concept in invert_concepts:
-                        maps_vis[c_idx] = -maps_vis[c_idx]
+                    # if concept in invert_concepts:
+                    #     maps_vis[c_idx] = -maps_vis[c_idx]
                     if concept in ["VOP"]:
                         # 获取当前通道的最大值和最小值
                         c_max = maps_vis[c_idx].max()
@@ -998,6 +1021,9 @@ def visualize_grid_overlays_by_grade_compare(
 # ==========================================
 def main():
     cfg = EvalConfig()
+    args = parse_args()
+    if args.checkpoint:
+        cfg.FUSION_CHECKPOINT = args.checkpoint
 
     # 1. 准备验证集数据
     val_transform = Compose(
@@ -1022,10 +1048,13 @@ def main():
     # 2. 初始化模型并加载权重
     # print("Loading Model Architecture and Weights...")
     # model = SALF_CBM(checkpoint_path=cfg.BACKBONE_PATH, concepts=cfg.CONCEPTS, device=cfg.DEVICE)
-    from graph_model_cbm_fusion_v2 import SALF_CBM_Fusion
+    from graph_model_cbm_fusion_v2_ablation import SALF_CBM_Fusion
 
     model = SALF_CBM_Fusion(
-        checkpoint_path=cfg.BACKBONE_PATH, concepts=cfg.CONCEPTS, device=cfg.DEVICE
+        checkpoint_path=cfg.BACKBONE_PATH,
+        concepts=cfg.CONCEPTS,
+        device=cfg.DEVICE,
+        ablation_stage=args.ablation_stage,
     )
     model.to(cfg.DEVICE)
 
@@ -1033,26 +1062,28 @@ def main():
     model.load_state_dict(checkpoint, strict=False)
     print("✅ Weights successfully loaded!")
 
-    # final_metrics = evaluate_metrics(
-    #     model,
-    #     val_loader,
-    #     cfg.DEVICE,
-    #     CONCEPT_COLUMNS,
-    #     bootstrap_eval=True,
-    #     n_bootstraps=10,
-    # )
-
-    visualize_grid_overlays_by_grade_compare(
+    final_metrics = evaluate_metrics(
         model,
-        val_dataset,
-        samples_per_grade=2,
-        save_dir=cfg.SAVE_DIR_VIS,
-        device=cfg.DEVICE,
+        val_loader,
+        cfg.DEVICE,
+        CONCEPT_COLUMNS,
+        bootstrap_eval=True,
+        n_bootstraps=10,
     )
+
+    if not args.skip_visualization:
+        visualize_grid_overlays_by_grade_compare(
+            model,
+            val_dataset,
+            samples_per_grade=2,
+            save_dir=cfg.SAVE_DIR_VIS,
+            device=cfg.DEVICE,
+        )
     # 3. 运行完整评估 (计算指标)
     # 开启 bootstrap，生成带方差的权威数据
 
-    # visualize_full_report()
+    if not args.skip_visualization:
+        visualize_full_report()
 
     # 4. ★ 运行可视化 (按分级抽样) ★
     # 设置每个 Grade 抽取 2 张图片 (总共会生成 10 张图)

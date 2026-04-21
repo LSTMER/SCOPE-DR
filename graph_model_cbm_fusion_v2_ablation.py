@@ -19,9 +19,19 @@ from mil_vt_model import MIL_VT_Model
 
 class SALF_CBM_Fusion(nn.Module):
     def __init__(
-        self, checkpoint_path, concepts, mil_vt_checkpoint=None, device="cuda"
+        self,
+        checkpoint_path,
+        concepts,
+        mil_vt_checkpoint=None,
+        device="cuda",
+        ablation_stage="full",
     ):
         """
+        Ablation stages:
+            vit_direct(0): 直接使用 ViT 全局特征 -> heads
+            cp(1): concept_projector
+            cp_graph(2): concept_projector + SpatialConceptGraph
+            full(3): concept_projector + SpatialConceptGraph + MIL gated fusion
         Args:
             checkpoint_path: RET-CLIP backbone 权重
             concepts: 概念列表
@@ -33,6 +43,11 @@ class SALF_CBM_Fusion(nn.Module):
         self.device = device
         self.concepts = concepts
         self.num_concepts = len(concepts)
+        self.ablation_stage = self._parse_ablation_stage(ablation_stage)
+        self.is_vit_direct = self.ablation_stage == 0
+        self.enable_concept_projector = self.ablation_stage >= 1
+        self.enable_spatial_graph = self.ablation_stage >= 2
+        self.enable_mil_fusion = self.ablation_stage >= 3
 
         # ==========================================
         # 1. 加载 Backbone (ViT-B/16)
@@ -82,7 +97,7 @@ class SALF_CBM_Fusion(nn.Module):
         ).to(self.device)
 
         # 如果提供了 MIL-VT 权重，加载它
-        if mil_vt_checkpoint is not None:
+        if mil_vt_checkpoint is not None and self.enable_mil_fusion:
             self.load_mil_vt_weights(mil_vt_checkpoint)
 
         # 冻结 MIL-VT（已经训练好）
@@ -109,6 +124,7 @@ class SALF_CBM_Fusion(nn.Module):
         # ==========================================
         concept_dim = self.num_concepts * 3  # 18
         fused_dim = concept_dim + self.graph_output  # 36
+        self.vit_feature_adapter = nn.Linear(768, concept_dim).to(device)
 
         self.headx = nn.Linear(concept_dim, 5).to(device)
 
@@ -121,6 +137,57 @@ class SALF_CBM_Fusion(nn.Module):
         ).to(device)
 
         self.final_headx = nn.Linear(fused_dim, 5).to(device)
+
+        print(
+            f"[Ablation] stage={self.ablation_stage} | "
+            f"vit_direct={self.is_vit_direct}, "
+            f"concept_projector={self.enable_concept_projector}, "
+            f"spatial_graph={self.enable_spatial_graph}, "
+            f"mil_fusion={self.enable_mil_fusion}"
+        )
+
+    @staticmethod
+    def _parse_ablation_stage(stage):
+        """
+        Progressive ablation:
+            0 / 'vit_direct': direct ViT feature -> heads
+            1 / 'cp'       : concept_projector
+            2 / 'cp_graph' : concept_projector + SpatialConceptGraph
+            3 / 'full'     : concept_projector + SpatialConceptGraph + MIL gated fusion
+        """
+        if isinstance(stage, int):
+            if stage in (0, 1, 2, 3):
+                return stage
+            raise ValueError(f"Unsupported ablation stage int: {stage}")
+
+        stage_key = str(stage).strip().lower()
+        mapping = {
+            "0": 0,
+            "vit": 0,
+            "vit_direct": 0,
+            "vit_only": 0,
+            "1": 1,
+            "cp": 1,
+            "projector": 1,
+            "2": 2,
+            "cp_graph": 2,
+            "projector_graph": 2,
+            "graph": 2,
+            "3": 3,
+            "full": 3,
+            "cp_graph_mil": 3,
+            "fusion": 3,
+        }
+        if stage_key not in mapping:
+            raise ValueError(f"Unsupported ablation stage: {stage}")
+        return mapping[stage_key]
+
+    def _fallback_concept_maps(self, patch_features):
+        """
+        Fallback mapping for non-standard stage=0 style usage.
+        """
+        concept_maps = patch_features[:, : self.num_concepts, :, :]
+        return torch.tanh(concept_maps)
 
     def _initialize_concept_projector_with_text(self):
         """使用 CLIP 文本特征初始化先验投影器"""
@@ -167,7 +234,7 @@ class SALF_CBM_Fusion(nn.Module):
         """加载预训练的 MIL-VT 权重"""
         print(f"Loading MIL-VT weights from {mil_vt_checkpoint_path}...")
         checkpoint = torch.load(mil_vt_checkpoint_path, map_location=self.device)
-        self.mil_vt.load_state_dict(checkpoint)
+        self.mil_vt.load_state_dict(checkpoint, strict=False)
         print("✅ MIL-VT weights loaded!")
 
     def forward(self, x, return_attention=False):
@@ -218,22 +285,29 @@ class SALF_CBM_Fusion(nn.Module):
             patch_features = feat.permute(0, 2, 1).reshape(
                 B, D, H, W
             )  # [B, 768, 14, 14]
+            vit_global_features = patch_features.mean(dim=(2, 3))  # [B, 768]
 
         # ==========================================
         # 2. 双路投影：CLIP 先验 + MIL-VT 数据驱动
         # ==========================================
         # A. CLIP 先验路
-        clip_concept_maps = self.concept_projector(patch_features)  # [B, 6, 14, 14]
+        if self.enable_concept_projector:
+            clip_concept_maps = self.concept_projector(patch_features)  # [B, 6, 14, 14]
+        else:
+            clip_concept_maps = self._fallback_concept_maps(patch_features)
 
         # B. MIL-VT 数据驱动路（调用预训练的 MIL-VT）
-        with torch.no_grad():
-            if return_attention:
-                mil_concept_maps, _, attention_weights = self.mil_vt(
-                    x, return_attention=True
-                )
-            else:
-                mil_concept_maps, _ = self.mil_vt(x, return_attention=False)
-                attention_weights = None
+        attention_weights = None
+        if self.enable_mil_fusion:
+            with torch.no_grad():
+                if return_attention:
+                    mil_concept_maps, _, attention_weights = self.mil_vt(
+                        x, return_attention=True
+                    )
+                else:
+                    mil_concept_maps, _ = self.mil_vt(x, return_attention=False)
+        else:
+            mil_concept_maps = clip_concept_maps
 
         # ==========================================
         # 3. 门控融合
@@ -244,10 +318,18 @@ class SALF_CBM_Fusion(nn.Module):
         # ==========================================
         # 4. 概念特征提取
         # ==========================================
-        c_mean = clip_concept_maps.mean(dim=(2, 3))
-        c_max = clip_concept_maps.amax(dim=(2, 3))
-        c_min = clip_concept_maps.amin(dim=(2, 3))
-        concept_features = torch.cat([c_mean, c_max, c_min], dim=1)  # [B, 18]
+        # c_mean = fused_concept_maps.mean(dim=(2, 3))
+        # c_max = fused_concept_maps.amax(dim=(2, 3))
+        # c_min = fused_concept_maps.amin(dim=(2, 3))
+        # concept_features = torch.cat([c_mean, c_max, c_min], dim=1)  # [B, 18]
+
+        if self.is_vit_direct:
+            concept_features = self.vit_feature_adapter(vit_global_features)  # [B, 18]
+        else:
+            c_mean = clip_concept_maps.mean(dim=(2, 3))
+            c_max = clip_concept_maps.amax(dim=(2, 3))
+            c_min = clip_concept_maps.amin(dim=(2, 3))
+            concept_features = torch.cat([c_mean, c_max, c_min], dim=1)  # [B, 18]
 
         # ==========================================
         # 5. 辅助病灶分类
@@ -260,25 +342,29 @@ class SALF_CBM_Fusion(nn.Module):
         # graph_features, after_graph_map = self.spatial_graph(
         #     fused_concept_maps
         # )
-        graph_features, after_graph_map = self.spatial_graph(clip_concept_maps)
+        if self.enable_spatial_graph:
+            graph_features, after_graph_map = self.spatial_graph(clip_concept_maps)
+        else:
+            after_graph_map = clip_concept_maps
+            g_mean = after_graph_map.mean(dim=(2, 3))
+            g_max = after_graph_map.amax(dim=(2, 3))
+            g_min = after_graph_map.amin(dim=(2, 3))
+            graph_features = torch.cat([g_mean, g_max, g_min], dim=1)
+        # 图推理后的结果和mil进行门控融合
         # 融合前通道度量对齐：
         # 通道 1(EX)、3(SE) 在当前图推理输出中为负相关方向，
         # 在门控融合前取相反数，统一“高响应=高病灶”语义。
         graph_map_for_fusion = after_graph_map.clone()
-        for c in [1, 3]:
-            # 分别获取当前通道的最大值和最小值
-            c_max = graph_map_for_fusion[:, [c], :, :].max()
-            c_min = graph_map_for_fusion[:, [c], :, :].min()
-
-            # 执行翻转映射：(max + min) - 原值
-            graph_map_for_fusion[:, [c], :, :] = (
-                c_max + c_min - graph_map_for_fusion[:, [c], :, :]
+        graph_map_for_fusion[:, [1, 3], :, :] = -graph_map_for_fusion[:, [1, 3], :, :]
+        if self.enable_mil_fusion:
+            fused_concept_maps, gate_alpha = self.fusion_module(
+                graph_map_for_fusion, mil_concept_maps
             )
-
-        # 图推理后的结果和mil进行门控融合
-        fused_concept_maps, gate_alpha = self.fusion_module(
-            graph_map_for_fusion, mil_concept_maps
-        )
+        else:
+            fused_concept_maps = graph_map_for_fusion
+            gate_alpha = torch.ones(
+                (x.size(0), self.num_concepts), device=x.device, dtype=x.dtype
+            )
         # print(gate_alpha)
 
         f_mean = fused_concept_maps.mean(dim=(2, 3))
@@ -289,7 +375,12 @@ class SALF_CBM_Fusion(nn.Module):
         # ==========================================
         # 7. 特征融合与最终分类
         # ==========================================
-        fused_features = torch.cat([concept_features, stat_features], dim=1)  # [B, 36]
+        if self.is_vit_direct:
+            fused_features = concept_features  # [B, 36]
+        else:
+            fused_features = torch.cat(
+                [concept_features, stat_features], dim=1
+            )  # [B, 36]
 
         grade_logits = self.headx(concept_features)
         lesion_logits_graph = self.lesion_head(fused_features)
@@ -316,7 +407,7 @@ class SALF_CBM_Fusion(nn.Module):
                 lesion_logits_aux,
                 lesion_logits_graph,
                 grade_logits_final,
-                after_graph_map,
+                fused_concept_maps,
             )
 
 

@@ -13,7 +13,7 @@ import os
 # 必须严格保证这里的顺序与你生成 npz 矩阵时的 CONCEPTS 顺序一致！
 CONCEPT_COLUMNS = ['HE', 'EX', 'MA', 'SE', 'VHE', 'VOP']
 
-class MultiModalDataset1(Dataset):
+class MultiModalDataset2(Dataset):
     def __init__(self, csv_paths, lmdb_path, npz_path, transform=None):
         """
         Args:
@@ -51,8 +51,8 @@ class MultiModalDataset1(Dataset):
         # assert len(self.df) == len(self.matrices), \
         #     f"严重错误：数据不对齐！CSV有 {len(self.df)} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
         if len(self.df) != len(self.matrices):
-            # self.start = 228
-            self.start = 1597
+            self.start = 228
+            # self.start = 1567
 
         assert len(self.df) + self.start == len(self.matrices), \
             f"严重错误：数据不对齐！CSV有 {len(self.df)+self.start} 行，但 NPZ有 {len(self.matrices)} 个矩阵。"
@@ -273,7 +273,7 @@ if __name__ == '__main__':
         ToTensor(), Normalize((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
     ])
     # my_dataset = MultiModalDataset(cfg.VAL_CSVS, cfg.VAL_LMDB, cfg.VAL_NPZ, transform=val_transform)
-    my_dataset = MultiModalDataset(cfg.TRAIN_CSVS, cfg.TRAIN_LMDB, cfg.TRAIN_NPZ, transform=train_transform)
+    my_dataset = MultiModalDataset2(cfg.TRAIN_CSVS, cfg.TRAIN_LMDB, cfg.TRAIN_NPZ, transform=train_transform)
 
 
     # 3. 调用上面写好的可视化函数 (这里展示 3 个样本)

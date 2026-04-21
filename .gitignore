@@ -10,3 +10,5 @@
 *.png
 *.TTC
 *.npy
+*.csv
+*.md

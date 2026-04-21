@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class MIL_VT_Projector(nn.Module):
     """
     MIL-VT 投影器：基于 Cross-Attention 的数据驱动病灶发现模块
@@ -11,6 +12,7 @@ class MIL_VT_Projector(nn.Module):
     - 通过 Cross-Attention 从 Patch Features 中自主发掘病灶区域
     - 输出与 CLIP_Projector 相同尺寸的概念图 [B, 6, 14, 14]
     """
+
     def __init__(self, num_concepts=6, feature_dim=768, num_heads=8, dropout=0.1):
         super().__init__()
         self.num_concepts = num_concepts
@@ -29,7 +31,7 @@ class MIL_VT_Projector(nn.Module):
             embed_dim=feature_dim,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=False  # 使用 (L, B, D) 格式
+            batch_first=False,  # 使用 (L, B, D) 格式
         )
 
         # 3. 前馈网络（可选，用于增强表达能力）
@@ -37,7 +39,7 @@ class MIL_VT_Projector(nn.Module):
             nn.Linear(feature_dim, feature_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(feature_dim * 2, feature_dim)
+            nn.Linear(feature_dim * 2, feature_dim),
         )
 
         # 4. Layer Normalization
@@ -69,11 +71,11 @@ class MIL_VT_Projector(nn.Module):
         # attn_output: [6, B, 768] - 每个概念聚合后的特征
         # attn_weights: [B, 6, 196] - 注意力权重矩阵
         attn_output, attn_weights = self.cross_attention(
-            query=queries,           # [6, B, 768]
-            key=patch_features_flat, # [196, B, 768]
+            query=queries,  # [6, B, 768]
+            key=patch_features_flat,  # [196, B, 768]
             value=patch_features_flat,
             need_weights=True,
-            average_attn_weights=True  # 对多头取平均
+            average_attn_weights=True,  # 对多头取平均
         )
 
         # 4. 残差连接 + Layer Norm
@@ -103,6 +105,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class GatedFusionModule(nn.Module):
     def __init__(self, num_concepts=6):
         super().__init__()
@@ -111,7 +114,7 @@ class GatedFusionModule(nn.Module):
             nn.Linear(num_concepts * 2, 32),
             nn.ReLU(),
             nn.Linear(32, num_concepts),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def global_min_max_norm(self, x, eps=1e-8):
@@ -129,9 +132,11 @@ class GatedFusionModule(nn.Module):
         # 2. 基础全局门控融合
         B = norm_clip.size(0)
         feat_clip = F.adaptive_avg_pool2d(norm_clip, (1, 1)).view(B, self.num_concepts)
-        feat_trans = F.adaptive_avg_pool2d(norm_trans, (1, 1)).view(B, self.num_concepts)
+        feat_trans = F.adaptive_avg_pool2d(norm_trans, (1, 1)).view(
+            B, self.num_concepts
+        )
         feat_combined = torch.cat([feat_clip, feat_trans], dim=1)
-        alpha = self.gate_network(feat_combined).view(B, self.num_concepts, 1, 1) * 0.5 + 0.5
+        alpha = self.gate_network(feat_combined).view(B, self.num_concepts, 1, 1)
 
         base_fused_maps = alpha * norm_clip + (1.0 - alpha) * norm_trans
 
@@ -139,10 +144,10 @@ class GatedFusionModule(nn.Module):
         # 🌟 核心升级：双重约束稀疏软路由 (Dual-Constraint Sparse Routing)
         # ==========================================
         # 条件 1: 全局均值 (跨通道、跨空间) -> 绝对门槛
-        global_mean = norm_trans.mean(dim=(1, 2, 3), keepdim=True) * 0.8 # [B, 1, 1, 1]
+        global_mean = norm_trans.mean(dim=(1, 2, 3), keepdim=True) * 0.8  # [B, 1, 1, 1]
 
         # 条件 2: 局部通道均值 (仅跨空间) -> 相对门槛
-        local_mean = norm_trans.mean(dim=(2, 3), keepdim=True) * 1.2 # [B, 6, 1, 1]
+        local_mean = norm_trans.mean(dim=(2, 3), keepdim=True) * 1.2  # [B, 6, 1, 1]
 
         # 计算两个边界的差值（Margin）
         margin_global = norm_trans - global_mean
@@ -154,7 +159,7 @@ class GatedFusionModule(nn.Module):
         strict_margin = torch.minimum(margin_global, margin_local)
 
         # 通过 Sigmoid 将差异转化为 [0, 1] 的平滑掩码
-        tau = 0.05 # 温度系数，调小一点让掩码更锐利、选取的极值更少
+        tau = 0.05  # 温度系数，调小一点让掩码更锐利、选取的极值更少
         soft_mask = torch.sigmoid(strict_margin / tau)
 
         # 最终融合：极少数的、最尖锐的病灶点用 MIL (norm_trans)，绝大部分用 base_fused_maps
